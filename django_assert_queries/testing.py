@@ -128,9 +128,24 @@ def assert_queries(
             error_lines += [
                 f'{indent}Expected {num_queries} queries, but got '
                 f'{num_executed_queries}',
-
-                '',
             ]
+            
+            # Check if any queries have shift-related notes
+            shift_detected = any(
+                mismatch.get('note') and
+                ('likely insertion' in mismatch.get('note', '') or
+                 'likely deletion' in mismatch.get('note', '') or
+                 'expected query was deletion' in mismatch.get('note', ''))
+                for mismatch in mismatches
+            )
+
+            if shift_detected:
+                error_lines.append(
+                    f'{indent}Note: Detected likely query shift. '
+                    f'Subsequent queries may appear mismatched due to position changes.'
+                )
+            
+            error_lines.append('')
 
         if results['has_mismatches']:
             num_mismatches = len(mismatches)

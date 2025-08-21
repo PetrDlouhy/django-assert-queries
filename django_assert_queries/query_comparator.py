@@ -539,6 +539,283 @@ def compare_queries(
         _check_subqueries=_check_subqueries))
 
 
+def _basic_query_match(
+    expected_query: Union[ExpectedQuery, Dict[str, Any]],
+    executed_query_info: _ExecutedQueryInfoT,
+) -> bool:
+    """Check if two queries match on basic attributes (model, type, tables).
+
+    This is used for shift detection - a simple heuristic to determine
+    if two queries are likely the same query.
+
+    Version Added:
+        2.2
+
+    Args:
+        expected_query:
+            The expected query information.
+        executed_query_info:
+            The executed query information.
+
+    Returns:
+        True if the queries appear to match on basic attributes.
+    """
+    executed_query = executed_query_info['query']
+    executed_model = executed_query.model
+
+    # Check model match
+    expected_model = expected_query.get('model')
+    if expected_model is not None and expected_model != executed_model:
+        return False
+
+    # Check type match
+    expected_type = expected_query.get('type', 'SELECT')
+    executed_type = executed_query_info['type'].value
+    if expected_type != executed_type:
+        return False
+
+    # Check basic table involvement
+    expected_tables = expected_query.get('tables')
+    if expected_tables is not None:
+        executed_table_name = (
+            executed_model._meta.db_table if executed_model else None
+        )
+        executed_reffed_tables: Set[str] = {
+            _table_name
+            for _table_name in executed_query.alias_map.keys()
+            if executed_query.alias_refcount.get(_table_name, 0) > 0
+        }
+
+        if executed_query.alias_refcount and executed_table_name:
+            executed_tables = executed_reffed_tables | {executed_table_name}
+        elif executed_table_name:
+            executed_tables = {executed_table_name}
+        else:
+            executed_tables = set()
+
+        # Check if there's significant overlap in tables
+        expected_tables_set = set(expected_tables)
+        overlap = len(expected_tables_set & executed_tables)
+        total_unique = len(expected_tables_set | executed_tables)
+
+        if total_unique > 0 and overlap / total_unique < 0.5:
+            return False
+
+    return True
+
+
+def _queries_match_with_skip(
+    expected_queries: List[Union[ExpectedQuery, Dict[str, Any]]],
+    executed_queries: Sequence[_ExecutedQueryInfoT],
+    *,
+    skip_executed: Optional[int] = None,
+    skip_expected: Optional[int] = None,
+) -> bool:
+    """Check if query sequences match when skipping one position.
+
+    Version Added:
+        2.2
+
+    Args:
+        expected_queries:
+            The list of expected queries.
+        executed_queries:
+            The list of executed queries.
+        skip_executed:
+            Index of executed query to skip.
+        skip_expected:
+            Index of expected query to skip.
+
+    Returns:
+        True if the sequences match well enough to suggest a shift.
+    """
+    exp_idx = 0
+    exec_idx = 0
+    matches = 0
+    total_compared = 0
+
+    while exp_idx < len(expected_queries) and exec_idx < len(executed_queries):
+        if exec_idx == skip_executed:
+            exec_idx += 1
+            continue
+        if exp_idx == skip_expected:
+            exp_idx += 1
+            continue
+
+        if _basic_query_match(expected_queries[exp_idx], executed_queries[exec_idx]):
+            matches += 1
+
+        total_compared += 1
+        exp_idx += 1
+        exec_idx += 1
+
+    # Use 70% threshold to avoid false positives
+    return total_compared > 0 and matches / total_compared >= 0.7
+
+
+def _find_insertion_point(
+    expected_queries: List[Union[ExpectedQuery, Dict[str, Any]]],
+    executed_queries: Sequence[_ExecutedQueryInfoT],
+) -> Optional[int]:
+    """Find where a single query was inserted in the executed queries.
+
+    Version Added:
+        2.2
+
+    Args:
+        expected_queries:
+            The list of expected queries.
+        executed_queries:
+            The list of executed queries.
+
+    Returns:
+        The index where insertion occurred, or None if no clear insertion found.
+    """
+    for i in range(len(executed_queries)):
+        if _queries_match_with_skip(
+            expected_queries, executed_queries, skip_executed=i
+        ):
+            return i
+
+    return None
+
+
+def _find_deletion_point(
+    expected_queries: List[Union[ExpectedQuery, Dict[str, Any]]],
+    executed_queries: Sequence[_ExecutedQueryInfoT],
+) -> Optional[int]:
+    """Find where a single query was deleted from the executed queries.
+
+    Version Added:
+        2.2
+
+    Args:
+        expected_queries:
+            The list of expected queries.
+        executed_queries:
+            The list of executed queries.
+
+    Returns:
+        The index where deletion occurred, or None if no clear deletion found.
+    """
+    for i in range(len(expected_queries)):
+        if _queries_match_with_skip(
+            expected_queries, executed_queries, skip_expected=i
+        ):
+            return i
+
+    return None
+
+
+def _detect_query_shift(
+    expected_queries: List[Union[ExpectedQuery, Dict[str, Any]]],
+    executed_queries: Sequence[_ExecutedQueryInfoT],
+) -> Tuple[Optional[str], Optional[int]]:
+    """Detect if there's a simple insertion/deletion causing a shift.
+
+    Version Added:
+        2.2
+
+    Args:
+        expected_queries:
+            The list of expected queries.
+        executed_queries:
+            The list of executed queries.
+
+    Returns:
+        (shift_type, shift_position) where shift_type is 'insertion', 'deletion',
+        or None, and shift_position is the index where the shift occurred.
+    """
+    if len(expected_queries) == len(executed_queries):
+        return None, None
+
+    # Try to find a single insertion point
+    if len(executed_queries) == len(expected_queries) + 1:
+        insertion_point = _find_insertion_point(expected_queries, executed_queries)
+        if insertion_point is not None:
+            return 'insertion', insertion_point
+
+    # Try to find a single deletion point
+    if len(expected_queries) == len(executed_queries) + 1:
+        deletion_point = _find_deletion_point(expected_queries, executed_queries)
+        if deletion_point is not None:
+            return 'deletion', deletion_point
+
+    return None, None
+
+
+def _adjust_queries_for_shift(
+    expected_queries: List[Union[ExpectedQuery, Dict[str, Any]]],
+    executed_queries: Sequence[_ExecutedQueryInfoT],
+    shift_type: str,
+    shift_position: int,
+) -> Tuple[List[Union[ExpectedQuery, Dict[str, Any]]], List[Tuple[int, int]]]:
+    """Adjust query lists to account for detected shift.
+
+    Version Added:
+        2.2
+
+    Args:
+        expected_queries:
+            The list of expected queries.
+        executed_queries:
+            The list of executed queries.
+        shift_type:
+            Either 'insertion' or 'deletion'.
+        shift_position:
+            The position where the shift occurred.
+
+    Returns:
+        (adjusted_expected_queries, index_mapping) where index_mapping is a list
+        of (expected_index, executed_index) tuples for comparison.
+    """
+    index_mapping = []
+
+    if shift_type == 'insertion':
+        # A query was inserted at shift_position in executed queries
+        for i in range(len(executed_queries)):
+            if i == shift_position:
+                # This is the inserted query - map to empty expected query
+                index_mapping.append((-1, i))  # -1 indicates no expected query
+            elif i < shift_position:
+                # Before insertion - direct mapping
+                index_mapping.append((i, i))
+            else:
+                # After insertion - shift expected index back by 1
+                index_mapping.append((i - 1, i))
+
+        # Pad expected queries with empty dict for the inserted query
+        adjusted_expected = expected_queries.copy()
+        adjusted_expected.insert(shift_position, {})
+
+    elif shift_type == 'deletion':
+        # A query was deleted at shift_position in expected queries
+        for i in range(len(expected_queries)):
+            if i == shift_position:
+                # This expected query was deleted - no mapping
+                continue
+            elif i < shift_position:
+                # Before deletion - direct mapping
+                index_mapping.append((i, i))
+            else:
+                # After deletion - shift executed index back by 1
+                if i - 1 < len(executed_queries):
+                    index_mapping.append((i, i - 1))
+
+        # Remove the deleted query from expected
+        adjusted_expected = expected_queries.copy()
+        adjusted_expected.pop(shift_position)
+
+    else:
+        # Should not happen, but fallback to direct mapping
+        adjusted_expected = expected_queries
+        index_mapping = [
+            (i, i) for i in range(min(len(expected_queries), len(executed_queries)))
+        ]
+
+    return adjusted_expected, index_mapping
+
+
 def _check_queries(
     *,
     expected_queries: List[Union[ExpectedQuery,
@@ -593,26 +870,54 @@ def _check_queries(
     num_executed_queries = len(executed_queries)
     query_count_mismatch: bool = False
     unchecked_mismatched_attrs = set()
+    shift_info: Optional[Tuple[str, int]] = None
 
     # Make sure we received the expected number of queries.
     if num_expected_queries != num_executed_queries:
         query_count_mismatch = True
+        
+        # Try to detect query shifts before falling back to padding
+        shift_type, shift_position = _detect_query_shift(
+            expected_queries, executed_queries
+        )
 
-        if num_expected_queries < num_executed_queries:
-            expected_queries += [
-                {}
-                for _i in range(num_executed_queries - num_expected_queries)
+        if shift_type is not None and shift_position is not None:
+            # We detected a shift - adjust the queries for better comparison
+            shift_info = (shift_type, shift_position)
+            adjusted_expected, index_mapping = _adjust_queries_for_shift(
+                expected_queries, executed_queries, shift_type, shift_position
+            )
+            expected_queries = adjusted_expected
+        else:
+            # Fall back to original padding behavior
+            if num_expected_queries < num_executed_queries:
+                expected_queries += [
+                    {}
+                    for _i in range(num_expected_queries, num_executed_queries)
+                ]
+            elif num_expected_queries > num_executed_queries:
+                expected_queries = expected_queries[:num_executed_queries]
+
+            # Create direct index mapping for original behavior
+            index_mapping = [
+                (i, i) for i in range(min(len(expected_queries), len(executed_queries)))
             ]
-        elif num_expected_queries > num_executed_queries:
-            expected_queries = expected_queries[:num_executed_queries]
 
-    # Go through each matching Query and compare state.
+    else:
+        # No count mismatch - direct mapping
+        index_mapping = [(i, i) for i in range(len(expected_queries))]
+
+    # Go through each matching Query and compare state using the index mapping.
     query_mismatches: List[QueryMismatch] = []
-    queries_iter = enumerate(zip(cast(Sequence[ExpectedQuery],
-                                      expected_queries),
-                                 executed_queries))
 
-    for i, (query_info, executed_query_info) in queries_iter:
+    for expected_idx, executed_idx in index_mapping:
+        if expected_idx == -1:
+            # This is an inserted query with no expected counterpart
+            query_info = {}
+        else:
+            query_info = expected_queries[expected_idx]
+        
+        executed_query_info = executed_queries[executed_idx]
         executed_query = executed_query_info['query']
         result = _check_query(
             executed_query=executed_query,
@@ -629,11 +934,29 @@ def _check_queries(
             (_check_subqueries and
              subqueries_compare_ctx is not None and
              subqueries_compare_ctx['has_mismatches'])):
+            
+            # Determine if this query is affected by a shift
+            shift_note = None
+            if shift_info is not None:
+                shift_type, shift_position = shift_info
+                if shift_type == 'insertion' and executed_idx == shift_position:
+                    shift_note = f"likely {shift_type}"
+                elif shift_type == 'deletion' and expected_idx == shift_position:
+                    shift_note = f"expected query was {shift_type}"
+
+            # Combine shift note with existing note
+            combined_note = query_info.get('__note__')
+            if shift_note:
+                if combined_note:
+                    combined_note = f"{combined_note}, {shift_note}"
+                else:
+                    combined_note = shift_note
+            
             query_mismatches.append({
                 'executed_query': executed_query,
-                'index': i,
+                'index': executed_idx,
                 'mismatched_attrs': mismatched_attrs,
-                'note': query_info.get('__note__'),
+                'note': combined_note,
                 'query_sql': cast(Optional[List[str]],
                                   executed_query_info.get('sql')),
                 'subqueries': subqueries_compare_ctx,
