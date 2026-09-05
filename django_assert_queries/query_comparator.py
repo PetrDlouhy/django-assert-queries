@@ -35,7 +35,8 @@ if TYPE_CHECKING:
 
     from django_assert_queries.query_catcher import (CatchQueriesContext,
                                                      ExecutedQueryInfo,
-                                                     ExecutedSubQueryInfo)
+                                                     ExecutedSubQueryInfo,
+                                                     TemplateFrameInfo)
 
     _T = TypeVar('_T')
     _ExecutedQueryInfoT = TypeVar('_ExecutedQueryInfoT',
@@ -93,6 +94,12 @@ class QueryMismatch(TypedDict):
 
     #: The results for any subquery matches.
     subqueries: Optional[CompareQueriesContext]
+
+    #: The template nodes being rendered when this query was executed.
+    #:
+    #: Version Added:
+    #:     3.0
+    template_info: Optional[List[TemplateFrameInfo]]
 
     #: Lines of traceback showing where this query was executed.
     traceback: Optional[List[str]]
@@ -638,6 +645,7 @@ def _check_queries(
                 'query_sql': cast(Optional[List[str]],
                                   executed_query_info.get('sql')),
                 'subqueries': subqueries_compare_ctx,
+                'template_info': executed_query_info.get('template_info'),
                 'traceback': cast(Optional[List[str]],
                                   executed_query_info.get('traceback')),
             })
