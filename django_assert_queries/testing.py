@@ -22,6 +22,7 @@ def assert_queries(
     *,
     with_tracebacks: bool = False,
     traceback_size: int = 15,
+    with_template_info: bool = False,
     check_join_types: bool = True,
     check_subqueries: bool = True,
 ) -> ContextManager:
@@ -36,6 +37,9 @@ def assert_queries(
     Version Added:
         2.0:
         Turned on ``check_join_types`` and ``check_subqueries`` by default.
+
+        3.0:
+        Added ``with_template_info``.
 
     Args:
         queries (list of django_equery.query_comparator.ExpectedQuery):
@@ -58,6 +62,11 @@ def assert_queries(
             The size of any tracebacks, in number of lines.
 
             The default is 15.
+
+        with_template_info (bool, optional):
+            If enabled, results for queries made while rendering a template
+            will include the template names, line numbers and tags leading
+            to the query.
 
         check_join_types (bool, optional):
             Whether to check join types.
@@ -155,6 +164,7 @@ def assert_queries(
                     i = mismatch_info['index']
                     note = mismatch_info['note']
                     traceback = mismatch_info.get('traceback')
+                    template_info = mismatch_info.get('template_info')
                     query_sql = mismatch_info.get('query_sql') or []
 
                     if note:
@@ -191,6 +201,16 @@ def assert_queries(
                             ''.join(traceback[-traceback_size:])
                         error_lines.append(
                             f'{indent}Trace: {traceback_str}')
+
+                    if with_template_info and template_info:
+                        error_lines.append(f'{indent}From template:')
+
+                        for frame_info in template_info:
+                            error_lines += [
+                                f'{inner_indent}{frame_info["template"]}:'
+                                f'{frame_info["lineno"]}:',
+                                f'{inner_indent}  {frame_info["contents"]}',
+                            ]
 
         return error_lines
 

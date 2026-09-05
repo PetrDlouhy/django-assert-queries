@@ -6,6 +6,7 @@ Version Added:
 
 from __future__ import annotations
 
+import sys
 import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -48,6 +49,23 @@ class ExecutedQueryType(str, Enum):
     UPDATE = 'UPDATE'
 
 
+class TemplateFrameInfo(TypedDict):
+    """Information on a template node that was rendering during a query.
+
+    Version Added:
+        3.0
+    """
+
+    #: The name of the template containing the node.
+    template: str
+
+    #: The line number of the node within the template.
+    lineno: int
+
+    #: The contents of the template tag or variable at that line.
+    contents: str
+
+
 class ExecutedQueryInfo(TypedDict):
     """Information on an executed query.
 
@@ -73,6 +91,16 @@ class ExecutedQueryInfo(TypedDict):
 
     #: Any subqueries within this query, in the orders found.
     subqueries: List[ExecutedSubQueryInfo]
+
+    #: The template nodes being rendered when the query was executed.
+    #:
+    #: This is ordered from the outermost template to the node that
+    #: triggered the query, and is empty for queries made outside of
+    #: template rendering.
+    #:
+    #: Version Added:
+    #:     3.0
+    template_info: List[TemplateFrameInfo]
 
     #: The lines of traceback showing where the query was executed.
     traceback: List[str]
@@ -137,6 +165,43 @@ class CatchQueriesContext:
 
     #: A mapping of SQL queries to their Q expressions.
     queries_to_qs: Dict[SQLQuery, Q]
+
+
+def _get_template_info() -> List[TemplateFrameInfo]:
+    """Return the template nodes being rendered on the current stack.
+
+    Django sets ``token`` and ``origin`` on every node it parses, and a
+    token always carries its line number and contents, so this works with
+    or without template debugging enabled.
+
+    Version Added:
+        3.0
+
+    Returns:
+        list of TemplateFrameInfo:
+        The nodes, from the outermost template to the innermost node.
+    """
+    result: List[TemplateFrameInfo] = []
+    frame = sys._getframe(1)
+
+    while frame is not None:
+        if frame.f_code.co_name == 'render_annotated':
+            node = frame.f_locals.get('self')
+            token = getattr(node, 'token', None)
+            origin = getattr(node, 'origin', None)
+
+            if token is not None and origin is not None:
+                result.append({
+                    'template': origin.template_name or origin.name,
+                    'lineno': token.lineno,
+                    'contents': token.contents,
+                })
+
+        frame = frame.f_back
+
+    result.reverse()
+
+    return result
 
 
 @contextmanager
@@ -210,6 +275,7 @@ def catch_queries(
                 'result_type': 'query',
                 'sql': sql,
                 'subqueries': subqueries,
+                'template_info': _get_template_info(),
                 'traceback': traceback.format_stack(),
                 'type': query_type,
             })
@@ -232,6 +298,7 @@ def catch_queries(
                 'result_type': 'query',
                 'sql': sql,
                 'subqueries': [],
+                'template_info': _get_template_info(),
                 'traceback': traceback.format_stack(),
                 'type': ExecutedQueryType.INSERT,
             })

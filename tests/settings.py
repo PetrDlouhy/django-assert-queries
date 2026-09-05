@@ -1,3 +1,5 @@
+import os
+
 DEBUG = True
 DATABASES = {
     'default': {
@@ -19,4 +21,16 @@ INSTALLED_APPS = [
     'django.contrib.sites',
     'django.contrib.staticfiles',
     'django_assert_queries.tests',
+]
+
+
+TEMPLATES = [
+    {
+        'BACKEND': 'django.template.backends.django.DjangoTemplates',
+        'DIRS': [
+            os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                         'django_assert_queries', 'tests', 'templates'),
+        ],
+        'APP_DIRS': True,
+    },
 ]
